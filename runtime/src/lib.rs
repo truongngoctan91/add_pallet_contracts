@@ -7,6 +7,7 @@
 include!(concat!(env!("OUT_DIR"), "/wasm_binary.rs"));
 
 use pallet_grandpa::AuthorityId as GrandpaId;
+use frame_support::pallet_prelude::DispatchClass;
 use sp_api::impl_runtime_apis;
 use frame_system::EventRecord;
 use frame_system::weights;
@@ -21,6 +22,7 @@ use sp_runtime::{
 	ApplyExtrinsicResult, MultiSignature,
 };
 use sp_std::prelude::*;
+use pallet_contracts::runtime_decl_for_contracts_api::ContractsApi;
 #[cfg(feature = "std")]
 use sp_version::NativeVersion;
 use sp_version::RuntimeVersion;
@@ -130,14 +132,39 @@ pub const MINUTES: BlockNumber = 60_000 / (MILLISECS_PER_BLOCK as BlockNumber);
 pub const HOURS: BlockNumber = MINUTES * 60;
 pub const DAYS: BlockNumber = HOURS * 24;
 
+
+/// We assume that ~10% of the block weight is consumed by `on_initialize` handlers.
+/// This is used to limit the maximal weight of a single extrinsic.
+const AVERAGE_ON_INITIALIZE_RATIO: Perbill = Perbill::from_percent(10);
+
+/// We allow for 2 seconds of compute with a 6 second average block time, with maximum proof size.
+const MAXIMUM_BLOCK_WEIGHT: Weight =
+	Weight::from_parts(WEIGHT_REF_TIME_PER_SECOND.saturating_mul(2), u64::MAX);
+
 // Prints debug output of the `contracts` pallet to stdout if the node is
 // started with `-lruntime::contracts=debug`.
 const CONTRACTS_DEBUG_OUTPUT: pallet_contracts::DebugInfo =
 	pallet_contracts::DebugInfo::UnsafeDebug;
 const CONTRACTS_EVENTS: pallet_contracts::CollectEvents =
 	pallet_contracts::CollectEvents::UnsafeCollect;
+// Unit = the base number of indivisible units for balances
+const UNIT: Balance = 1_000_000_000_000;
+const MILLIUNIT: Balance = 1_000_000_000;
+pub const EXISTENTIAL_DEPOSIT: Balance = MILLIUNIT;
 
-
+	const fn deposit(items: u32, bytes: u32) -> Balance {
+		(items as Balance * UNIT + (bytes as Balance) * (5 * MILLIUNIT / 100)) / 10
+	}
+	
+	fn schedule<T: pallet_contracts::Config>() -> pallet_contracts::Schedule<T> {
+		pallet_contracts::Schedule {
+			limits: pallet_contracts::Limits {
+				runtime_memory: 1024 * 1024 * 1024,
+				..Default::default()
+			},
+			..Default::default()
+		}
+	}
 
 
 
@@ -160,6 +187,24 @@ parameter_types! {
 		);
 	pub BlockLength: frame_system::limits::BlockLength = frame_system::limits::BlockLength
 		::max_with_normal_ratio(5 * 1024 * 1024, NORMAL_DISPATCH_RATIO);
+		pub RuntimeBlockWeights: BlockWeights = BlockWeights::builder()
+		.base_block(BlockExecutionWeight::get())
+		.for_class(DispatchClass::all(), |weights| {
+			weights.base_extrinsic = ExtrinsicBaseWeight::get();
+		})
+		.for_class(DispatchClass::Normal, |weights| {
+			weights.max_total = Some(NORMAL_DISPATCH_RATIO * MAXIMUM_BLOCK_WEIGHT);
+		})
+		.for_class(DispatchClass::Operational, |weights| {
+			weights.max_total = Some(MAXIMUM_BLOCK_WEIGHT);
+			// Operational transactions have some extra reserved space, so that they
+			// are included even if block reached `MAXIMUM_BLOCK_WEIGHT`.
+			weights.reserved = Some(
+				MAXIMUM_BLOCK_WEIGHT - NORMAL_DISPATCH_RATIO * MAXIMUM_BLOCK_WEIGHT
+			);
+		})
+		.avg_block_initialization(AVERAGE_ON_INITIALIZE_RATIO)
+		.build_or_panic();
 	pub const SS58Prefix: u8 = 42;
 }
 
@@ -234,8 +279,6 @@ impl pallet_timestamp::Config for Runtime {
 	type WeightInfo = ();
 }
 
-/// Existential deposit.
-pub const EXISTENTIAL_DEPOSIT: u128 = 500;
 
 impl pallet_balances::Config for Runtime {
 	type MaxLocks = ConstU32<50>;
@@ -282,23 +325,26 @@ impl pallet_template::Config for Runtime {
 
 
 impl pallet_insecure_randomness_collective_flip::Config for Runtime {}
+parameter_types! {
+	pub const DepositPerItem: Balance = deposit(1, 0);
+	pub const DepositPerByte: Balance = deposit(0, 1);
+	pub Schedule: pallet_contracts::Schedule<Runtime> = schedule::<Runtime>();
+	pub const DefaultDepositLimit: Balance = deposit(1024, 1024 * 1024);
+}
 
-// Create the runtime by composing the FRAME pallets that were previously configured.
-construct_runtime!(
-	pub struct Runtime {
-		System: frame_system,
-		Timestamp: pallet_timestamp,
-		Aura: pallet_aura,
-		Grandpa: pallet_grandpa,
-		Balances: pallet_balances,
-		TransactionPayment: pallet_transaction_payment,
-		Sudo: pallet_sudo,
-		RandomnessCollectiveFlip: pallet_insecure_randomness_collective_flip,
-		// Include the custom logic from the pallet-template in the runtime.
-		TemplateModule: pallet_template,
-		Contracts: pallet_contracts,
+impl pallet_utility::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type RuntimeCall = RuntimeCall;
+	type PalletsOrigin = OriginCaller;
+	type WeightInfo = pallet_utility::weights::SubstrateWeight<Runtime>;
+}
+pub enum AllowBalancesCall {}
+
+impl frame_support::traits::Contains<RuntimeCall> for AllowBalancesCall {
+	fn contains(call: &RuntimeCall) -> bool {
+		matches!(call, RuntimeCall::Balances(BalancesCall::transfer_allow_death { .. }))
 	}
-);
+}
 
 impl pallet_contracts::Config for Runtime {
 	type Time = Timestamp;
@@ -319,7 +365,7 @@ impl pallet_contracts::Config for Runtime {
 	type CallStack = [pallet_contracts::Frame<Self>; 23];
 	type WeightPrice = pallet_transaction_payment::Pallet<Self>;
 	type WeightInfo = pallet_contracts::weights::SubstrateWeight<Self>;
-	type ChainExtension = ();
+	type ChainExtension = pallet_assets_chain_extension::substrate::AssetsExtension;
 	type Schedule = Schedule;
 	type AddressGenerator = pallet_contracts::DefaultAddressGenerator;
 	// This node is geared towards development and testing of contracts.
@@ -335,16 +381,29 @@ impl pallet_contracts::Config for Runtime {
 	type MaxStorageKeyLen = ConstU32<128>;
 	type MaxDebugBufferLen = ConstU32<{ 2 * 1024 * 1024 }>;
 	type UnsafeUnstableInterface = ConstBool<true>;
-	type CodeHashLockupDepositPercent = CodeHashLockupDepositPercent;
-	type MaxDelegateDependencies = MaxDelegateDependencies;
-	type RuntimeHoldReason = RuntimeHoldReason;
-
-	type Environment = ();
-	type Debug = ();
 	type Migrations = ();
 }
 
-impl pallet_contracts::ContractsApi<Block, AccountId, Balance, BlockNumber, Hash, EventRecord>
+// Create the runtime by composing the FRAME pallets that were previously configured.
+construct_runtime!(
+	pub struct Runtime {
+		System: frame_system,
+		Timestamp: pallet_timestamp,
+		Aura: pallet_aura,
+		Grandpa: pallet_grandpa,
+		Balances: pallet_balances,
+		TransactionPayment: pallet_transaction_payment,
+		Sudo: pallet_sudo,
+		RandomnessCollectiveFlip: pallet_insecure_randomness_collective_flip,
+		// Include the custom logic from the pallet-template in the runtime.
+		TemplateModule: pallet_template,
+		Contracts: pallet_contracts,
+		Utility: pallet_utility,
+	}
+);
+
+
+impl<T,E> ContractsApi<Block, AccountId, Balance, BlockNumber, Hash, EventRecord<E, T>>
 for Runtime
 {
 fn call(
@@ -354,7 +413,7 @@ fn call(
 	gas_limit: Option<Weight>,
 	storage_deposit_limit: Option<Balance>,
 	input_data: Vec<u8>,
-) -> pallet_contracts_primitives::ContractExecResult<Balance, EventRecord> {
+) -> pallet_contracts_primitives::ContractExecResult<Balance, EventRecord<E, T>> {
 	let gas_limit = gas_limit.unwrap_or(RuntimeBlockWeights::get().max_block);
 	Contracts::bare_call(
 		origin,
@@ -377,7 +436,7 @@ fn instantiate(
 	code: pallet_contracts_primitives::Code<Hash>,
 	data: Vec<u8>,
 	salt: Vec<u8>,
-) -> pallet_contracts_primitives::ContractInstantiateResult<AccountId, Balance, EventRecord>
+) -> pallet_contracts_primitives::ContractInstantiateResult<AccountId, Balance, EventRecord<E, T>>
 {
 	let gas_limit = gas_limit.unwrap_or(RuntimeBlockWeights::get().max_block);
 	Contracts::bare_instantiate(
@@ -409,7 +468,7 @@ fn get_storage(
 ) -> pallet_contracts_primitives::GetStorageResult {
 	Contracts::get_storage(address, key)
 }
-	}
+}
 
 /// The address format for describing accounts.
 pub type Address = sp_runtime::MultiAddress<AccountId, ()>;
